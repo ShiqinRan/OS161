@@ -403,7 +403,7 @@ cmd_dbthreads(int nargs, char **args)
 	(void)nargs;
 	(void)args;
 
-	dbflags = dbflags ^ DB_THREADS;
+	dbflags = dbflags | DB_THREADS;
 
 	return 0;
 }
