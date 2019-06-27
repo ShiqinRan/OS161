@@ -149,7 +149,7 @@ intersection_before_entry(Direction origin, Direction destination)
   V = kmalloc(sizeof(Vehicle));
   V->origin = origin;
   V->destination = destination;
-
+	kprintf("Incoming:%d %d \n",origin,destination);
   lock_acquire(intersectionLock);
 
   for(unsigned int i = 0; i < array_num(intersectionCar); i++){
@@ -186,12 +186,15 @@ intersection_after_exit(Direction origin, Direction destination)
 
   lock_acquire(intersectionLock);
 
+  kprintf("Exiting:%d %d \n",origin,destination);
+
   for(unsigned int i=0; i<array_num(intersectionCar); i++) {
     Vehicle *existingVehicle; 
     existingVehicle = array_get(intersectionCar, i);
     if(existingVehicle->origin == origin && existingVehicle->destination == destination) {
       array_remove(intersectionCar,i);
       cv_broadcast(intersectionCV,intersectionLock);
+
       break;
     }
   }

@@ -9,6 +9,9 @@
 #include <thread.h>
 #include <addrspace.h>
 #include <copyinout.h>
+#include <synch.h>
+#include <mips/trapframe.h>
+#include "opt-A2.h"
 
   /* this implementation of sys__exit does not do anything with the exit code */
   /* this needs to be fixed to get exit() and waitpid() working properly */
@@ -92,3 +95,66 @@ sys_waitpid(pid_t pid,
   return(0);
 }
 
+pid_t
+sys_fork(struct trapframe *parent_tf, pid_t *retval) {
+  KASSERT(curproc != NULL);
+
+  struct proc *child_proc;
+  int result;
+
+  //create child process structure
+  child_proc = proc_create_runprogram(curproc->p_name);
+  if(child_proc == NULL) {
+    return ENOMEM;
+  }
+
+  //create new address space for child process
+  struct addrspace *child_addrspace;
+  struct addrspace *parent_addrspace;
+
+  parent_addrspace = curproc_getas();
+  result = as_copy(parent_addrspace, &child_addrspace);
+  if(result) {
+    proc_destroy(child_proc);
+    return ENOMEM;
+  }
+
+  //set child process address space
+  spinlock_acquire(&child_proc->p_lock);
+  child_proc->p_addrspace = child_addrspace;
+  spinlock_release(&child_proc->p_lock);
+
+  //copy parent trapframe on the heap
+  struct trapframe *child_tf = kmalloc(sizeof(struct trapframe));
+  if(child_tf == NULL) {
+    proc_destroy(child_proc);
+    return ENOMEM;
+  }
+  memcpy(child_tf,parent_tf,sizeof(struct trapframe));
+
+  //set parent child relationship
+  spinlock_acquire(&child_proc->p_lock);
+  child_proc->p_parent = curproc;
+  spinlock_release(&child_proc->p_lock);
+
+  spinlock_acquire(&curproc->p_lock);
+  array_add(curproc->p_children,child_proc,NULL);
+  spinlock_release(&curproc->p_lock);
+
+  //create thread for chid process
+  result = thread_fork(curthread->t_name,child_proc,enter_forked_process,(void *)child_tf,0);
+  if(result) {
+    proc_destroy(child_proc);
+    kfree(child_tf);
+    return ENOMEM;
+  }
+
+  //set return value for parent
+  *retval = child_proc->pid;
+
+  //free copied trapframe on heap
+ // kfree(child_tf);
+
+  //return 0 to child process if fork success
+  return (0);
+}

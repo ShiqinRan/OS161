@@ -38,6 +38,8 @@
 
 #include <spinlock.h>
 #include <thread.h> /* required for struct threadarray */
+#include <array.h>
+#include "opt-A2.h"
 
 struct addrspace;
 struct vnode;
@@ -66,6 +68,14 @@ struct proc {
      system calls, since each process will need to keep track of all files
      it has opened, not just the console. */
   struct vnode *console;                /* a vnode for the console device */
+#endif
+
+#if OPT_A2
+  pid_t pid;
+  struct proc *p_parent;
+  struct array *p_children;
+
+  struct lock *cleanup_lock;
 #endif
 
 	/* add more material here as needed */
@@ -100,5 +110,8 @@ struct addrspace *curproc_getas(void);
 /* Change the address space of the current process, and return the old one. */
 struct addrspace *curproc_setas(struct addrspace *);
 
+#if OPT_A2
+pid_t new_pid(void);
+#endif
 
 #endif /* _PROC_H_ */
