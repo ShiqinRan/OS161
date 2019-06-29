@@ -42,10 +42,41 @@ void sys__exit(int exitcode) {
   /* note: curproc cannot be used after this call */
   proc_remthread(curthread);
 
-  /* if this is the last user process in the system, proc_destroy()
+   #if OPT_A2
+
+  struct proc *parent = p->p_parent;
+
+  if(parent == NULL) { /*no living parent, can fully delete*/
+    /* if this is the last user process in the system, proc_destroy()
      will wake up the kernel menu thread */
-  proc_destroy(p);
-  
+    proc_destroy(p);
+  } else { /*has living parent. move to dead children array*/
+    //set exited to true and save the exit_code
+    lock_acquire(p->set_lock);
+    p->exit_code = exitcode;
+    p->exited = 1;
+    lock_release(p->set_lock);
+
+    //wake up waiting parent
+    lock_acquire(p->wait_lock);
+    cv_broadcast(p->wait_cv, p->wait_lock);
+    lock_release(p->wait_lock);
+
+    DEBUG(DB_SYSCALL, "moving living to dead \n");
+    lock_acquire(parent->set_lock);
+    for(unsigned i = 0; i < array_num(parent->p_living_children); i++) {
+      struct proc *child = array_get(parent->p_living_children,i);
+      if(child->pid == p->pid) {
+        array_add(parent->p_dead_children,p,NULL);
+        array_remove(parent->p_living_children,i);
+        break;
+      }
+    }
+    lock_release(parent->set_lock);
+
+  }
+
+  #endif
   thread_exit();
   /* thread_exit() does not return, so we should never get here */
   panic("return from thread_exit in sys_exit\n");
@@ -58,7 +89,7 @@ sys_getpid(pid_t *retval)
 {
   /* for now, this is just a stub that always returns a PID of 1 */
   /* you need to fix this to make it work properly */
-  *retval = 1;
+  *retval = curproc->pid;;
   return(0);
 }
 
@@ -81,12 +112,37 @@ sys_waitpid(pid_t pid,
 
      Fix this!
   */
+  KASSERT(status!= NULL);
 
   if (options != 0) {
     return(EINVAL);
   }
+  
+  #if OPT_A2
+  //search through living_children array
+  struct proc* living_child = look_through_children(curproc->p_living_children,pid);
+  //search through dead_children array
+  struct proc* dead_child = look_through_children(curproc->p_dead_children, pid);
+
+  //if the child is dead fetch exit code
+  if(dead_child != NULL){
+    exitstatus = _MKWAIT_EXIT(dead_child->exit_code);
+  }else if (living_child != NULL) { //if child is living, go to block
+    lock_acquire(living_child->wait_lock);
+    while(living_child->exited == 1) {
+      cv_wait(living_child->wait_cv, living_child->wait_lock);
+    }
+    lock_release(living_child->wait_lock);
+  }else{ //if not one of curproc children return -1
+    *retval = -1;
+    return(EINVAL);
+  }
+
+  #else
   /* for now, just pretend the exitstatus is 0 */
   exitstatus = 0;
+  #endif
+
   result = copyout((void *)&exitstatus,status,sizeof(int));
   if (result) {
     return(result);
@@ -138,7 +194,7 @@ sys_fork(struct trapframe *parent_tf, pid_t *retval) {
   spinlock_release(&child_proc->p_lock);
 
   spinlock_acquire(&curproc->p_lock);
-  array_add(curproc->p_children,child_proc,NULL);
+  array_add(curproc->p_living_children,child_proc,NULL);
   spinlock_release(&curproc->p_lock);
 
   //create thread for chid process

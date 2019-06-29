@@ -90,6 +90,16 @@ pid_t new_pid() {
 	lock_release(pid_lock);
 	return -1;
 }
+
+struct proc* look_through_children(struct array* children, pid_t pid) {
+	for(unsigned i = 0; i< array_num(children); i++) {
+		struct proc* child = array_get(children,i);
+		if(child->pid == pid) {
+			return child;
+		}
+	}
+	return NULL;
+}
 #endif
 
 /*
@@ -120,23 +130,41 @@ proc_create(const char *name)
 #endif // UW
 
 #if OPT_A2
+	proc->exited = 0;
+	proc->exit_code = 0;
 	proc->pid = new_pid();
 	if(proc->pid == -1) {
 		return NULL;
 	}
 	proc->p_parent = NULL;
 
-	proc->p_children = array_create();
-	array_init(proc->p_children);
+	proc->p_living_children = array_create();
+	array_init(proc->p_living_children);
 
-	proc->cleanup_lock = lock_create("cleanup_lock");
-	if(proc->cleanup_lock == NULL) {
+	proc->p_dead_children = array_create();
+	array_init(proc->p_dead_children);
+
+	proc->set_lock = lock_create("set_lock");
+	if(proc->set_lock == NULL) {
+		kfree(proc->p_name);
+		kfree(proc);
+		return NULL;
+	}
+
+	proc->wait_lock = lock_create("wait_lock");
+	if(proc->wait_lock == NULL) {
+		kfree(proc->p_name);
+		kfree(proc);
+		return NULL;
+	}
+
+	proc->wait_cv = cv_create("wait_cv");
+	if(proc->wait_cv == NULL) {
 		kfree(proc->p_name);
 		kfree(proc);
 		return NULL;
 	}
 #endif
-
 	return proc;
 }
 /*
@@ -193,23 +221,48 @@ proc_destroy(struct proc *proc)
 	spinlock_cleanup(&proc->p_lock);
 
 #if OPT_A2
-	//clean up the children array
-	for(unsigned i =0; i < array_num(proc->p_children); i++) {
-		struct proc *child = array_get(proc->p_children,i);
-		lock_acquire(child->cleanup_lock);
+	//clean up the living children array
+	DEBUG(DB_SYSCALL, "start living children cleanup\n. living children num: %d\n", array_num(proc->p_living_children));
+	for(unsigned i =0; i < array_num(proc->p_living_children); i++) {
+		struct proc *child = array_get(proc->p_living_children,i);
+		lock_acquire(child->set_lock);
 		child->p_parent = NULL;
-		array_remove(proc->p_children,i);
-		lock_release(child->cleanup_lock);
+		array_remove(proc->p_living_children,i);
+		lock_release(child->set_lock);
 	}
-	array_cleanup(proc->p_children);
-	array_destroy(proc->p_children);
+	DEBUG(DB_SYSCALL, "clean up living children finished");
+
+	//destroy all dead children
+	DEBUG(DB_SYSCALL, "start dead children destroy\n. dead children num: %d\n", array_num(proc->p_dead_children));
+	for(unsigned i=0; i < array_num(proc->p_dead_children); i++) {
+		struct proc *child = array_get(proc->p_dead_children,i);
+		KASSERT(child->exited == 1);
+		proc_destroy(child);
+	}
+	DEBUG(DB_SYSCALL, "destroy up dead children finished\n");
+
+	//remove all dead children
+	DEBUG(DB_SYSCALL, "start dead children removal\n. dead children num: %d\n", array_num(proc->p_dead_children));
+	for(unsigned i=array_num(proc->p_dead_children); i > 0; i--) {
+		array_remove(proc->p_dead_children,i-1);
+	}
+	DEBUG(DB_SYSCALL, "removal dead children finished\n");
+
+	//destroy children array
+	array_destroy(proc->p_living_children);
+	array_destroy(proc->p_dead_children);
+	DEBUG(DB_SYSCALL,"child array destroyed\n");
 
 	//free the pid for reuse
 	lock_acquire(pid_lock);
 	pid_list[proc->pid] = 0;
 	lock_release(pid_lock);
-#endif
 
+	//destroy internal lock
+	lock_destroy(proc->set_lock);
+	lock_destroy(proc->wait_lock);
+	cv_destroy(proc->wait_cv);
+#endif
 	kfree(proc->p_name);
 	kfree(proc);
 #ifdef UW

@@ -72,10 +72,15 @@ struct proc {
 
 #if OPT_A2
   pid_t pid;
-  struct proc *p_parent;
-  struct array *p_children;
+  int exited;
+  int exit_code;
 
-  struct lock *cleanup_lock;
+  struct proc *p_parent;
+  struct array *p_living_children;
+  struct array *p_dead_children;
+  struct lock *set_lock;
+  struct lock *wait_lock;
+  struct cv* wait_cv;
 #endif
 
 	/* add more material here as needed */
@@ -112,6 +117,7 @@ struct addrspace *curproc_setas(struct addrspace *);
 
 #if OPT_A2
 pid_t new_pid(void);
+struct proc* look_through_children(struct array* children, pid_t pid);
 #endif
 
 #endif /* _PROC_H_ */
