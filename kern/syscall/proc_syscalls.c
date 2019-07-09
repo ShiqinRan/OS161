@@ -129,10 +129,11 @@ sys_waitpid(pid_t pid,
     exitstatus = _MKWAIT_EXIT(dead_child->exit_code);
   }else if (living_child != NULL) { //if child is living, go to block
     lock_acquire(living_child->wait_lock);
-    while(living_child->exited == 1) {
+    while(living_child->exited == 0) {
       cv_wait(living_child->wait_cv, living_child->wait_lock);
     }
     lock_release(living_child->wait_lock);
+    exitstatus = _MKWAIT_EXIT(living_child->exit_code);
   }else{ //if not one of curproc children return -1
     *retval = -1;
     return(EINVAL);
