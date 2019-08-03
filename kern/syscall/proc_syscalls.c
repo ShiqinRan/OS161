@@ -2,6 +2,7 @@
 #include <kern/errno.h>
 #include <kern/unistd.h>
 #include <kern/wait.h>
+#include <kern/fcntl.h>
 #include <lib.h>
 #include <syscall.h>
 #include <current.h>
@@ -11,6 +12,8 @@
 #include <copyinout.h>
 #include <synch.h>
 #include <mips/trapframe.h>
+#include <vfs.h>
+#include <vm.h>
 #include "opt-A2.h"
 
   /* this implementation of sys__exit does not do anything with the exit code */
@@ -215,3 +218,193 @@ sys_fork(struct trapframe *parent_tf, pid_t *retval) {
   //return 0 to child process if fork success
   return (0);
 }
+
+#if OPT_A2
+
+int sys_execv(const char *program, char **args) {
+	int result;
+	struct addrspace *as;
+	struct vnode *v;
+	vaddr_t entrypoint, stackptr;
+	(void)args;
+
+	//counting args
+  	int argc = 0;
+  	while(args[argc] != NULL) {
+    		argc++;
+ 	 }
+  //	kprintf("number of args: %d \n", argc);
+
+	  //allocate space for string params
+  char **argv = (char **)kmalloc((argc+1) * sizeof(char *));
+  for(int i = 0; i < argc; i++) {
+    argv[i] = (char *)kmalloc(128 * sizeof(char));
+    size_t arg_len = strlen(args[i]) + 1;
+    if(argv[i] == NULL) {
+      for(int j = 0; j < i; j++) {
+        kfree(argv[j]);
+      }
+      kfree(argv);
+      return ENOMEM;
+    }
+    //copy individual args to kernel
+    result = copyin((const_userptr_t)args[i], (void *)argv[i],arg_len);
+    if(result) {
+      for(int j = 0; j < i; j++) {
+        kfree(argv[j]);
+      }
+      kfree(argv);
+      return result;
+    }
+   // kprintf("%s \n",argv[i]);
+  }
+  argv[argc] = NULL;
+
+  //copy path from user space to kernel
+	size_t program_len = (strlen(program) + 1) * sizeof(char);
+	char *kern_program = kmalloc(program_len); //allocate space in kernel space
+	if(kern_program == NULL) {
+		return ENOMEM;
+	}
+	result = copyin((const_userptr_t)program,(void *)kern_program,program_len);
+	if(result) {
+		kfree(kern_program);
+		return result;
+	}
+
+	//open program file
+	char *kprog_temp = kstrdup(kern_program);
+	result = vfs_open(kprog_temp, O_RDONLY, 0, &v);
+	if(result) {
+		kfree(kprog_temp);
+		kfree(kern_program);
+		return result;
+	}
+
+	//create new address space
+	as = as_create();
+	if (as == NULL) {
+		kfree(kprog_temp);
+		kfree(kern_program);
+		vfs_close(v);
+		return ENOMEM;
+	}
+
+	//set process to new address space and activate it
+	struct addrspace *old_as = curproc_setas(as);
+	//as_activate();
+
+	//load program
+	result = load_elf(v, &entrypoint);
+	if (result) {
+		kfree(kprog_temp);
+		kfree(kern_program);
+		as_deactivate();
+		as = curproc_setas(old_as);
+		as_destroy(as);
+		vfs_close(v);
+		return result;
+	}
+	vfs_close(v);
+	kfree(kprog_temp);
+	kfree(kern_program);
+
+	result = as_define_stack_arg(as, &stackptr, argc, argv);
+/*
+	//copy onto user stack
+	result = as_define_stack(as, &stackptr);
+	if (result) {
+		as_deactivate();
+		as = curproc_setas(old_as);
+		as_destroy(as);
+		return result;
+	}
+
+  vaddr_t temp_stackptr = stackptr; //tracker pointer
+  vaddr_t *arg_ptr = kmalloc((argc + 1) * sizeof(vaddr_t)); //array of pointer to argument srtrings on stack
+  size_t total_string_size  = 0;
+
+  kprintf("putting strings on stack\n");
+  //put strings on to stack
+  for(int i = argc-1; i >= 0; i--) {
+    size_t arg_len = strlen(argv[i]) + 1;
+    size_t arg_size = arg_len * sizeof(char);
+    total_string_size += arg_size;
+    temp_stackptr -= arg_size; //address of start of string
+
+    kprintf("copying: %s\n",argv[i]);
+  
+    result = copyout((void *)argv[i], (userptr_t) temp_stackptr, arg_len);
+    if(result) {
+      for(int i = 0; i < argc; i++) {
+        kfree(argv[i]);
+      }
+      kfree(argv);
+      kfree(arg_ptr);
+      as = curproc_setas(old_as);
+      as_destroy(as);
+      return result;
+    }
+    arg_ptr[i] = temp_stackptr;
+    kprintf("copied: %s\n",(char *)arg_ptr[i]);
+  }
+  arg_ptr[argc] = (vaddr_t) NULL;
+
+  //alignment for ptrs
+  temp_stackptr = stackptr-ROUNDUP(total_string_size,4);
+  KASSERT(temp_stackptr % 4 == 0);
+
+  kprintf("putting ptrs on stack\n");
+  //put string ptrs on to stack
+  //calculate lowest address needed
+  size_t ptr_size = sizeof(vaddr_t);
+  size_t total_array_size = ptr_size * (argc + 1);
+  temp_stackptr -= total_array_size;
+  KASSERT(temp_stackptr % 4 == 0);
+  result = copyout((void *)arg_ptr, (userptr_t) temp_stackptr, total_array_size);
+  *//*
+  for(int i = argc ; i >= 0; i--) {
+    size_t ptr_size = sizeof(vaddr_t);
+    temp_stackptr -= ptr_size;
+    result = copyout((void *)&arg_ptr[i], (userptr_t) temp_stackptr, ptr_size);
+    if(result) {
+      for(int i = 0; i < argc; i++) {
+        kfree(argv[i]);
+      }
+      kfree(argv);
+      kfree(arg_ptr);
+      as = curproc_setas(old_as);
+      as_destroy(as);
+      return result;
+    }
+  }*/
+  if(result) {
+    for(int i = 0; i < argc; i++) {
+      kfree(argv[i]);
+    }
+    kfree(argv);
+    //kfree(arg_ptr);
+    as = curproc_setas(old_as);
+    as_destroy(as);
+    return result;
+  }
+
+
+	//delete old address space
+  for(int i = 0; i < argc; i++) {
+      kfree(argv[i]);
+  }
+  kfree(argv);
+  as_destroy(old_as);
+
+  //kprintf("entering new process\n");
+	//enter new process
+	enter_new_process(argc,(userptr_t)stackptr,ROUNDUP(stackptr, 8),entrypoint);
+
+
+	panic("enter_new_process returned\n");
+	return EINVAL;
+
+}
+
+#endif

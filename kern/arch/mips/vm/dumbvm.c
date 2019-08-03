@@ -37,6 +37,9 @@
 #include <mips/tlb.h>
 #include <addrspace.h>
 #include <vm.h>
+#include "opt-A3.h"
+#include <synch.h>
+#include <copyinout.h>
 
 /*
  * Dumb MIPS-only "VM system" that is intended to only be just barely
@@ -46,6 +49,11 @@
 /* under dumbvm, always have 48k of user stack */
 #define DUMBVM_STACKPAGES    12
 
+static int *coremap;
+static int coremap_created = 0;
+static int total_frames;
+static struct lock *coremap_lock;
+static paddr_t first_addr, last_addr;
 /*
  * Wrap rma_stealmem in a spinlock.
  */
@@ -54,6 +62,32 @@ static struct spinlock stealmem_lock = SPINLOCK_INITIALIZER;
 void
 vm_bootstrap(void)
 {
+	#if OPT_A3
+	coremap_lock = lock_create("coremap_lock");
+	lock_acquire(coremap_lock);
+
+	ram_getsize(&first_addr, &last_addr);
+	coremap = (int*)PADDR_TO_KVADDR(first_addr);
+	//total number of frames
+	total_frames = (last_addr - first_addr) / PAGE_SIZE;
+
+	//coremap size
+	int coremap_size = sizeof(int) * total_frames;
+	int coremap_frames = (coremap_size + PAGE_SIZE - 1) / PAGE_SIZE;
+	total_frames -= coremap_frames;
+
+	first_addr += coremap_frames * PAGE_SIZE;
+	KASSERT(first_addr % PAGE_SIZE == 0);
+
+	//set up coremap
+	for (int i = 0; i < total_frames; i++) {
+		coremap[i] = 0;
+	}
+
+	coremap_created = 1;
+	lock_release(coremap_lock);
+
+	#endif
 	/* Do nothing. */
 }
 
@@ -63,11 +97,41 @@ getppages(unsigned long npages)
 {
 	paddr_t addr;
 
-	spinlock_acquire(&stealmem_lock);
+	if(coremap_created == 1) {
+		lock_acquire(coremap_lock);
+		int index = 0;
+		unsigned long empty = 0;
+		while(empty < npages) {
+			if(index >= total_frames) {
+				empty = 0;
+				panic("Not enough pages\n");
+			}
+			if(coremap[index] == 0) {
+				empty++;
+				index++;
+			}else{
+				empty = 0;
+				index++;
+			}
+		}
+		int temp = index;
+		for(;index >= 0 && npages > 0; index--, npages--) {
+			coremap[index-1] = npages;
+		}
+		//////////
+		//////////
+		lock_release(coremap_lock);
+		addr = (paddr_t)(first_addr + (temp * PAGE_SIZE));
+	}else{
 
-	addr = ram_stealmem(npages);
+		spinlock_acquire(&stealmem_lock);
+
+		addr = ram_stealmem(npages);
+
+		spinlock_release(&stealmem_lock);
+	}
+
 	
-	spinlock_release(&stealmem_lock);
 	return addr;
 }
 
@@ -87,8 +151,28 @@ void
 free_kpages(vaddr_t addr)
 {
 	/* nothing - leak the memory. */
-
-	(void)addr;
+	#if OPT_A3
+	lock_acquire(coremap_lock);
+	paddr_t paddr = addr - MIPS_KSEG0;
+	KASSERT(paddr % PAGE_SIZE == 0);
+	int frame_index = (paddr - first_addr) / PAGE_SIZE;
+	while(true) {
+		if (frame_index == total_frames -1) {
+			coremap[frame_index] = 0;
+			break;
+		}
+		int cur_val = coremap[frame_index];
+		int next_val = coremap[frame_index + 1];
+		if (cur_val >= next_val) {
+			coremap[frame_index] = 0;
+			break;
+		}else{
+			coremap[frame_index] = 0;
+			frame_index++;
+		}
+	}
+	lock_release(coremap_lock);
+	#endif
 }
 
 void
@@ -121,7 +205,7 @@ vm_fault(int faulttype, vaddr_t faultaddress)
 	switch (faulttype) {
 	    case VM_FAULT_READONLY:
 		/* We always create pages read-write, so we can't get this */
-		panic("dumbvm: got VM_FAULT_READONLY\n");
+		return EFAULT;
 	    case VM_FAULT_READ:
 	    case VM_FAULT_WRITE:
 		break;
@@ -195,14 +279,31 @@ vm_fault(int faulttype, vaddr_t faultaddress)
 		ehi = faultaddress;
 		elo = paddr | TLBLO_DIRTY | TLBLO_VALID;
 		DEBUG(DB_VM, "dumbvm: 0x%x -> 0x%x\n", faultaddress, paddr);
+#if OPT_A3
+		if (faultaddress >= vbase1 && faultaddress < vtop1 && as->loaded_elf) {
+			elo &= ~TLBLO_DIRTY;
+		}
+#endif
 		tlb_write(ehi, elo, i);
 		splx(spl);
 		return 0;
 	}
 
+#if OPT_A3
+	ehi = faultaddress;
+	elo = paddr | TLBLO_DIRTY | TLBLO_VALID;
+	if (faultaddress >= vbase1 && faultaddress < vtop1 && as->loaded_elf) {
+		elo &= ~TLBLO_DIRTY;
+	}
+	tlb_random(ehi,elo);
+	splx(spl);
+	return 0;
+
+#else
 	kprintf("dumbvm: Ran out of TLB entries - cannot handle page fault\n");
 	splx(spl);
 	return EFAULT;
+#endif
 }
 
 struct addrspace *
@@ -213,6 +314,9 @@ as_create(void)
 		return NULL;
 	}
 
+#if OPT_A3
+	as->loaded_elf = 0;
+#endif
 	as->as_vbase1 = 0;
 	as->as_pbase1 = 0;
 	as->as_npages1 = 0;
@@ -227,7 +331,9 @@ as_create(void)
 void
 as_destroy(struct addrspace *as)
 {
-	kfree(as);
+	free_kpages(PADDR_TO_KVADDR(as->as_pbase1));
+	free_kpages(PADDR_TO_KVADDR(as->as_pbase2));
+	free_kpages(PADDR_TO_KVADDR(as->as_stackpbase));
 }
 
 void
@@ -338,7 +444,9 @@ as_prepare_load(struct addrspace *as)
 int
 as_complete_load(struct addrspace *as)
 {
-	(void)as;
+#if OPT_A3
+	as->loaded_elf = 1;
+#endif
 	return 0;
 }
 
@@ -391,3 +499,49 @@ as_copy(struct addrspace *old, struct addrspace **ret)
 	*ret = new;
 	return 0;
 }
+
+
+int as_define_stack_arg(struct addrspace *as, vaddr_t *stackptr, int argc, char **argv) {
+	  int result;
+	  KASSERT(as->as_stackpbase != 0);
+	  vaddr_t temp_stackptr = USERSTACK; //tracker pointer
+	  vaddr_t *arg_ptr = kmalloc((argc + 1) * sizeof(vaddr_t)); //array of pointer to argument srtrings on stack
+	  size_t total_string_size  = 0;
+
+	  //put strings on to stack
+	  for(int i = argc-1; i >= 0; i--) {
+	    size_t arg_len = strlen(argv[i]) + 1;
+	    size_t arg_size = arg_len * sizeof(char);
+	    total_string_size += arg_size;
+	    temp_stackptr -= arg_size; //address of start of string
+
+	    result = copyout((void *)argv[i], (userptr_t) temp_stackptr, arg_len);
+	    if(result) {
+	      kfree(arg_ptr);
+	      return result;
+	    }
+	    arg_ptr[i] = temp_stackptr;
+	  }
+	  arg_ptr[argc] = (vaddr_t) NULL;
+
+	  //alignment for ptrs
+	  temp_stackptr = USERSTACK-ROUNDUP(total_string_size,4);
+	  KASSERT(temp_stackptr % 4 == 0);
+
+	  //put string ptrs on to stack
+	  //calculate lowest address needed
+	  size_t ptr_size = sizeof(vaddr_t);
+	  size_t total_array_size = ptr_size * (argc + 1);
+	  temp_stackptr -= total_array_size;
+	  KASSERT(temp_stackptr % 4 == 0);
+	  result = copyout((void *)arg_ptr, (userptr_t) temp_stackptr, total_array_size);
+	  if(result){
+	  	kfree(arg_ptr);
+		return result;
+	  }
+	  
+	  *stackptr = temp_stackptr;
+
+	  return 0;
+	}
+

@@ -39,7 +39,14 @@
 #include <vm.h>
 #include <mainbus.h>
 #include <syscall.h>
-
+#include <addrspace.h>
+#include <spinlock.h>
+#include <signal.h>
+#include <proc.h>
+#include <copyinout.h>
+#include <synch.h>
+#include <kern/wait.h>
+#include "opt-A3.h"
 
 /* in exception.S */
 extern void asm_usermode(struct trapframe *tf);
@@ -111,6 +118,65 @@ kill_curthread(vaddr_t epc, unsigned code, vaddr_t vaddr)
 	/*
 	 * You will probably want to change this.
 	 */
+
+	#if OPT_A3
+	  struct addrspace *as;
+	  struct proc *p = curproc;
+	  /* for now, just include this to keep the compiler from complaining about
+	     an unused variable */
+
+	  KASSERT(curproc->p_addrspace != NULL);
+	  as_deactivate();
+	  /*
+	   * clear p_addrspace before calling as_destroy. Otherwise if
+	   * as_destroy sleeps (which is quite possible) when we
+	   * come back we'll be calling as_activate on a
+	   * half-destroyed address space. This tends to be
+	   * messily fatal.
+	   */
+	  as = curproc_setas(NULL);
+	  as_destroy(as);
+
+	  /* detach this thread from its process */
+	  /* note: curproc cannot be used after this call */
+	  proc_remthread(curthread);
+
+	  struct proc *parent = p->p_parent;
+
+	  if(parent == NULL) { /*no living parent, can fully delete*/
+	    /* if this is the last user process in the system, proc_destroy()
+	     will wake up the kernel menu thread */
+	    proc_destroy(p);
+	  } else { /*has living parent. move to dead children array*/
+	    //set exited to true and save the exit_code
+	    lock_acquire(p->set_lock);
+	    p->exit_code = _MKWAIT_SIG(sig);
+	    p->exited = 1;
+	    lock_release(p->set_lock);
+
+	    //wake up waiting parent
+	    lock_acquire(p->wait_lock);
+	    cv_broadcast(p->wait_cv, p->wait_lock);
+	    lock_release(p->wait_lock);
+
+	    DEBUG(DB_SYSCALL, "moving living to dead \n");
+	    lock_acquire(parent->set_lock);
+	    for(unsigned i = 0; i < array_num(parent->p_living_children); i++) {
+	      struct proc *child = array_get(parent->p_living_children,i);
+	      if(child->pid == p->pid) {
+	        array_add(parent->p_dead_children,p,NULL);
+	        array_remove(parent->p_living_children,i);
+	        break;
+	      }
+	    }
+	    lock_release(parent->set_lock);
+
+	  }
+
+	  thread_exit();
+	  /* thread_exit() does not return, so we should never get here */
+	  panic("return from thread_exit in sys_exit\n");
+	#endif
 
 	kprintf("Fatal user mode trap %u sig %d (%s, epc 0x%x, vaddr 0x%x)\n",
 		code, sig, trapcodenames[code], epc, vaddr);
@@ -232,6 +298,10 @@ mips_trap(struct trapframe *tf)
 	switch (code) {
 	case EX_MOD:
 		if (vm_fault(VM_FAULT_READONLY, tf->tf_vaddr)==0) {
+			goto done;
+		}
+		else {
+			kill_curthread(tf->tf_epc, code, tf->tf_vaddr);
 			goto done;
 		}
 		break;

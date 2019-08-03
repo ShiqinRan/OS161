@@ -227,7 +227,6 @@ proc_destroy(struct proc *proc)
 		struct proc *child = array_get(proc->p_living_children,i);
 		lock_acquire(child->set_lock);
 		child->p_parent = NULL;
-		array_remove(proc->p_living_children,i);
 		lock_release(child->set_lock);
 	}
 	DEBUG(DB_SYSCALL, "clean up living children finished");
@@ -241,6 +240,12 @@ proc_destroy(struct proc *proc)
 	}
 	DEBUG(DB_SYSCALL, "destroy up dead children finished\n");
 
+	//remove all living children
+	DEBUG(DB_SYSCALL, "start living children removal\n");
+	for(unsigned i = array_num(proc->p_living_children); i > 0; i--){
+		array_remove(proc->p_living_children,i-1);
+	}
+	
 	//remove all dead children
 	DEBUG(DB_SYSCALL, "start dead children removal\n. dead children num: %d\n", array_num(proc->p_dead_children));
 	for(unsigned i=array_num(proc->p_dead_children); i > 0; i--) {
@@ -249,7 +254,9 @@ proc_destroy(struct proc *proc)
 	DEBUG(DB_SYSCALL, "removal dead children finished\n");
 
 	//destroy children array
+	DEBUG(DB_SYSCALL, "removing living children\n. living children num:%d\n", array_num(proc->p_living_children));
 	array_destroy(proc->p_living_children);
+	DEBUG(DB_SYSCALL,"removing dead children\n");
 	array_destroy(proc->p_dead_children);
 	DEBUG(DB_SYSCALL,"child array destroyed\n");
 
